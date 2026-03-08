@@ -1,126 +1,196 @@
-"""
-NEXUS-AGI Working Memory
-Short-term context storage for active reasoning
-"""
-from __future__ import annotations
+"""WorkingMemory - fast, limited-capacity scratchpad with priority eviction."""
+
+import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-from collections import OrderedDict
+from datetime import datetime
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+logger = logging.getLogger("nexus.memory.working")
 
 
 @dataclass
-class WorkingMemorySlot:
+class MemoryItem:
     key: str
     value: Any
-    priority: float = 0.5
-    created_at: float = field(default_factory=time.time)
-    last_accessed: float = field(default_factory=time.time)
+    priority: float = 0.5          # 0.0 = low, 1.0 = critical
+    ttl_seconds: Optional[float] = None
+    created_at: float = field(default_factory=time.monotonic)
+    last_accessed: float = field(default_factory=time.monotonic)
     access_count: int = 0
-    ttl: Optional[float] = None  # seconds until expiry
+    tags: List[str] = field(default_factory=list)
+    pinned: bool = False            # pinned items are never evicted
 
     def is_expired(self) -> bool:
-        if self.ttl is None:
+        if self.ttl_seconds is None:
             return False
-        return time.time() - self.created_at > self.ttl
+        return (time.monotonic() - self.created_at) > self.ttl_seconds
+
+    def eviction_score(self) -> float:
+        """Lower score = evict first."""
+        if self.pinned:
+            return float("inf")
+        age = time.monotonic() - self.last_accessed
+        recency = 1.0 / (1.0 + age)
+        return self.priority * 0.5 + recency * 0.3 + min(self.access_count, 100) / 100.0 * 0.2
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"key": self.key, "priority": self.priority, "ttl_seconds": self.ttl_seconds, "access_count": self.access_count, "tags": self.tags, "pinned": self.pinned, "expired": self.is_expired(), "eviction_score": round(self.eviction_score(), 4)}
 
 
 class WorkingMemory:
     """
-    Short-term working memory with LRU eviction and TTL support.
-    Holds active context for ongoing reasoning tasks.
+    Fixed-capacity working memory (cognitive scratchpad).
+    Evicts lowest-priority / least-recently-used items when full.
+    Supports TTL expiry, pinning, tagging, and snapshots.
     """
 
-    def __init__(self, capacity: int = 100):
+    def __init__(self, capacity: int = 128):
         self.capacity = capacity
-        self._slots: OrderedDict[str, WorkingMemorySlot] = OrderedDict()
-        self._context_stack: List[Dict[str, Any]] = []
+        self._store: Dict[str, MemoryItem] = {}
+        self._tag_index: Dict[str, List[str]] = {}  # tag -> [keys]
+        self._hit_count = 0
+        self._miss_count = 0
+        self._eviction_count = 0
 
-    def set(self, key: str, value: Any, priority: float = 0.5,
-            ttl: Optional[float] = None) -> WorkingMemorySlot:
-        # Evict expired first
-        self._evict_expired()
+    # ------------------------------------------------------------------
+    # Core CRUD
+    # ------------------------------------------------------------------
 
-        if key in self._slots:
-            slot = self._slots[key]
-            slot.value = value
-            slot.priority = priority
-            slot.last_accessed = time.time()
-            self._slots.move_to_end(key)
-            return slot
-
-        if len(self._slots) >= self.capacity:
-            self._evict_lru()
-
-        slot = WorkingMemorySlot(key=key, value=value, priority=priority, ttl=ttl)
-        self._slots[key] = slot
-        return slot
+    def set(self, key: str, value: Any, priority: float = 0.5, ttl: Optional[float] = None, tags: Optional[List[str]] = None, pin: bool = False) -> MemoryItem:
+        self._purge_expired()
+        if key not in self._store and len(self._store) >= self.capacity:
+            self._evict_one()
+        item = MemoryItem(key=key, value=value, priority=max(0.0, min(1.0, priority)), ttl_seconds=ttl, tags=tags or [], pinned=pin)
+        self._store[key] = item
+        for tag in item.tags:
+            self._tag_index.setdefault(tag, []).append(key)
+        return item
 
     def get(self, key: str, default: Any = None) -> Any:
-        slot = self._slots.get(key)
-        if slot is None:
+        self._purge_expired()
+        item = self._store.get(key)
+        if item is None or item.is_expired():
+            self._miss_count += 1
+            if item:
+                self._remove(key)
             return default
-        if slot.is_expired():
-            del self._slots[key]
-            return default
-        slot.last_accessed = time.time()
-        slot.access_count += 1
-        self._slots.move_to_end(key)
-        return slot.value
+        item.last_accessed = time.monotonic()
+        item.access_count += 1
+        self._hit_count += 1
+        return item.value
+
+    def get_item(self, key: str) -> Optional[MemoryItem]:
+        return self._store.get(key)
 
     def delete(self, key: str) -> bool:
-        if key in self._slots:
-            del self._slots[key]
+        if key in self._store:
+            self._remove(key)
             return True
         return False
 
-    def clear(self) -> int:
-        count = len(self._slots)
-        self._slots.clear()
-        return count
+    def exists(self, key: str) -> bool:
+        item = self._store.get(key)
+        if item and item.is_expired():
+            self._remove(key)
+            return False
+        return item is not None
 
-    def push_context(self, context: Dict[str, Any]) -> None:
-        self._context_stack.append(context)
-        for k, v in context.items():
-            self.set(k, v, priority=0.8, ttl=300)
+    def update_priority(self, key: str, priority: float) -> bool:
+        if key in self._store:
+            self._store[key].priority = max(0.0, min(1.0, priority))
+            return True
+        return False
 
-    def pop_context(self) -> Optional[Dict[str, Any]]:
-        if self._context_stack:
-            return self._context_stack.pop()
-        return None
+    def pin(self, key: str) -> bool:
+        if key in self._store:
+            self._store[key].pinned = True
+            return True
+        return False
 
-    def get_current_context(self) -> Dict[str, Any]:
-        return self._context_stack[-1] if self._context_stack else {}
+    def unpin(self, key: str) -> bool:
+        if key in self._store:
+            self._store[key].pinned = False
+            return True
+        return False
 
-    def get_all(self, include_expired: bool = False) -> Dict[str, Any]:
-        result = {}
-        for key, slot in list(self._slots.items()):
-            if not include_expired and slot.is_expired():
-                continue
-            result[key] = slot.value
+    def clear(self, include_pinned: bool = False) -> int:
+        if include_pinned:
+            count = len(self._store)
+            self._store.clear()
+            self._tag_index.clear()
+            return count
+        unpinned = [k for k, v in self._store.items() if not v.pinned]
+        for k in unpinned:
+            self._remove(k)
+        return len(unpinned)
+
+    # ------------------------------------------------------------------
+    # Tag-based retrieval
+    # ------------------------------------------------------------------
+
+    def get_by_tag(self, tag: str) -> List[MemoryItem]:
+        keys = self._tag_index.get(tag, [])
+        result = []
+        for k in list(keys):
+            item = self._store.get(k)
+            if item and not item.is_expired():
+                result.append(item)
         return result
 
-    def _evict_expired(self) -> int:
-        expired = [k for k, s in self._slots.items() if s.is_expired()]
+    def keys_by_tag(self, tag: str) -> List[str]:
+        return [item.key for item in self.get_by_tag(tag)]
+
+    # ------------------------------------------------------------------
+    # Iteration & snapshots
+    # ------------------------------------------------------------------
+
+    def items(self) -> Iterator[Tuple[str, Any]]:
+        self._purge_expired()
+        for key, item in self._store.items():
+            yield key, item.value
+
+    def snapshot(self) -> Dict[str, Any]:
+        self._purge_expired()
+        return {k: v.value for k, v in self._store.items()}
+
+    def restore(self, snapshot: Dict[str, Any], priority: float = 0.5) -> None:
+        for k, v in snapshot.items():
+            self.set(k, v, priority=priority)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _evict_one(self) -> None:
+        evictable = {k: v for k, v in self._store.items() if not v.pinned}
+        if not evictable:
+            return
+        victim = min(evictable, key=lambda k: evictable[k].eviction_score())
+        self._remove(victim)
+        self._eviction_count += 1
+        logger.debug("Evicted key=%s", victim)
+
+    def _purge_expired(self) -> int:
+        expired = [k for k, v in self._store.items() if v.is_expired()]
         for k in expired:
-            del self._slots[k]
+            self._remove(k)
         return len(expired)
 
-    def _evict_lru(self) -> None:
-        # Evict lowest priority + least recently used
-        if not self._slots:
-            return
-        lru_key = min(self._slots.keys(),
-                      key=lambda k: (self._slots[k].priority, self._slots[k].last_accessed))
-        del self._slots[lru_key]
+    def _remove(self, key: str) -> None:
+        item = self._store.pop(key, None)
+        if item:
+            for tag in item.tags:
+                if tag in self._tag_index:
+                    self._tag_index[tag] = [k for k in self._tag_index[tag] if k != key]
+                    if not self._tag_index[tag]:
+                        del self._tag_index[tag]
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
 
     def stats(self) -> Dict[str, Any]:
-        self._evict_expired()
-        return {
-            "capacity": self.capacity,
-            "used": len(self._slots),
-            "utilization": round(len(self._slots) / self.capacity, 3),
-            "context_depth": len(self._context_stack),
-            "avg_priority": round(sum(s.priority for s in self._slots.values()) / len(self._slots), 3)
-                            if self._slots else 0,
-        }
+        self._purge_expired()
+        total = self._hit_count + self._miss_count
+        return {"capacity": self.capacity, "used": len(self._store), "utilisation": round(len(self._store) / max(self.capacity, 1), 3), "hit_rate": round(self._hit_count / max(total, 1), 3), "hits": self._hit_count, "misses": self._miss_count, "evictions": self._eviction_count, "pinned": sum(1 for v in self._store.values() if v.pinned), "tags": list(self._tag_index.keys())}
