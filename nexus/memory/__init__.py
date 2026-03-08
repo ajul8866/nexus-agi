@@ -1,6 +1,12 @@
-from .episodic import EpisodicMemory
-from .semantic import SemanticMemory
-from .working import WorkingMemory
-from .long_term import LongTermMemory
+"""NEXUS-AGI Memory subsystem."""
+from nexus.memory.episodic import EpisodicMemory, Episode
+from nexus.memory.semantic import SemanticMemory, Concept
+from nexus.memory.working import WorkingMemory, MemoryItem
+from nexus.memory.long_term import LongTermMemory
 
-__all__ = ["EpisodicMemory", "SemanticMemory", "WorkingMemory", "LongTermMemory"]
+__all__ = [
+    "EpisodicMemory", "Episode",
+    "SemanticMemory", "Concept",
+    "WorkingMemory", "MemoryItem",
+    "LongTermMemory",
+]
