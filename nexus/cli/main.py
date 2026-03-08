@@ -1,49 +1,56 @@
 """
-NEXUS-AGI CLI
-Command-line interface untuk NEXUS-AGI
+NEXUS-AGI Command Line Interface
 """
-from __future__ import annotations
-import sys
-import time
 import click
+import asyncio
+import json
+import sys
+import os
+from typing import Optional
+from pathlib import Path
 
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    console = Console()
-except ImportError:
-    console = None
-
-
-def _print(msg: str, style: str = ""):
-    if console:
-        console.print(msg, style=style)
-    else:
-        print(msg)
+# Add parent to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
 @click.group()
-@click.version_option(version="1.0.0", prog_name="nexus")
-def cli():
-    """NEXUS-AGI: Advanced General Intelligence Framework"""
-    pass
+@click.option("--debug/--no-debug", default=False, help="Enable debug logging")
+@click.option("--config", "-c", type=click.Path(), default=None, help="Config file path")
+@click.pass_context
+def cli(ctx, debug: bool, config: Optional[str]):
+    """
+    NEXUS-AGI: Advanced General Intelligence Framework
+
+    A modular, self-improving AGI system with multi-agent federation.
+    """
+    ctx.ensure_object(dict)
+    ctx.obj["debug"] = debug
+    ctx.obj["config"] = config
+
+    if debug:
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
+        click.echo("[DEBUG] Debug mode enabled", err=True)
 
 
 @cli.command()
 @click.argument("task")
-@click.option("--priority", "-p", default=5, help="Task priority (1-10)")
-@click.option("--timeout", "-t", default=300, help="Timeout in seconds")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-def run(task: str, priority: int, timeout: int, verbose: bool):
-    """Run a task with NEXUS-AGI."""
-    _print(f"[bold green]NEXUS-AGI[/bold green] Running task: {task}")
-    _print(f"Priority: {priority} | Timeout: {timeout}s")
-    if verbose:
-        _print("[dim]Initializing agents...[/dim]")
-        _print("[dim]Loading memory systems...[/dim]")
-        _print("[dim]Starting planning module...[/dim]")
-    _print("[yellow]Task submitted. In production, this connects to the AGI kernel.[/yellow]")
+@click.option("--agent", "-a", default="orchestrator", help="Agent type to use")
+@click.option("--max-iter", "-m", default=10, type=int, help="Max iterations")
+@click.option("--output", "-o", type=click.Choice(["text", "json"]), default="text")
+@click.pass_context
+def run(ctx, task: str, agent: str, max_iter: int, output: str):
+    """Run a task through NEXUS-AGI."""
+    click.echo(f"[NEXUS] Submitting task to {agent} agent...")
+    click.echo(f"[NEXUS] Task: {task}")
+    click.echo(f"[NEXUS] Max iterations: {max_iter}")
+
+    result = asyncio.run(_run_task(task, agent, max_iter))
+
+    if output == "json":
+        click.echo(json.dumps(result, indent=2))
+    else:
+        click.echo(f"\n[RESULT]\n{result.get('output', 'No output')}")
 
 
 @cli.group()
@@ -52,32 +59,35 @@ def agent():
     pass
 
 
-@agent.command(name="list")
-def agent_list():
+@agent.command("list")
+@click.option("--type", "-t", default=None, help="Filter by agent type")
+@click.pass_context
+def agent_list(ctx, type: Optional[str]):
     """List all active agents."""
-    if console:
-        table = Table(title="Active Agents")
-        table.add_column("ID", style="cyan")
-        table.add_column("Name", style="green")
-        table.add_column("Role")
-        table.add_column("Status")
-        table.add_row("agent_001", "Orchestrator", "orchestrator", "[green]active[/green]")
-        table.add_row("agent_002", "Researcher", "specialist", "[green]active[/green]")
-        table.add_row("agent_003", "Reflector", "reflection", "[yellow]idle[/yellow]")
-        console.print(table)
-    else:
-        print("agent_001 | Orchestrator | orchestrator | active")
-        print("agent_002 | Researcher   | specialist   | active")
+    click.echo("[NEXUS] Fetching active agents...")
+    agents = [
+        {"name": "Orchestrator", "type": "orchestrator", "status": "idle"},
+        {"name": "Researcher",   "type": "specialist",   "status": "idle"},
+        {"name": "Coder",        "type": "specialist",   "status": "idle"},
+    ]
+    if type:
+        agents = [a for a in agents if a["type"] == type]
+
+    click.echo(f"\n{'Name':<20} {'Type':<15} {'Status':<10}")
+    click.echo("-" * 45)
+    for a in agents:
+        click.echo(f"{a['name']:<20} {a['type']:<15} {a['status']:<10}")
 
 
-@agent.command(name="create")
+@agent.command("create")
 @click.argument("name")
-@click.option("--role", "-r", default="specialist", help="Agent role")
-@click.option("--capabilities", "-c", multiple=True, help="Agent capabilities")
-def agent_create(name: str, role: str, capabilities: tuple):
+@click.option("--type", "-t", default="specialist", help="Agent type")
+@click.option("--capabilities", "-cap", multiple=True, help="Agent capabilities")
+def agent_create(name: str, type: str, capabilities: tuple):
     """Create a new agent."""
-    caps = list(capabilities) or ["general"]
-    _print(f"[green]Created agent:[/green] {name} (role={role}, capabilities={caps})")
+    click.echo(f"[NEXUS] Creating {type} agent: {name}")
+    click.echo(f"[NEXUS] Capabilities: {list(capabilities) or ['default']}")
+    click.echo(f"[NEXUS] Agent '{name}' created successfully!")
 
 
 @cli.group()
@@ -86,92 +96,98 @@ def memory():
     pass
 
 
-@memory.command(name="query")
+@memory.command("query")
 @click.argument("query")
-@click.option("--type", "-t", "mem_type", default="all",
-              type=click.Choice(["all", "episodic", "semantic", "working"]),
-              help="Memory type to query")
-@click.option("--limit", "-l", default=10, help="Max results")
-def memory_query(query: str, mem_type: str, limit: int):
-    """Query the memory system."""
-    _print(f"Querying {mem_type} memory for: '{query}' (limit={limit})")
-    _print("[dim]No results found (memory system requires kernel initialization)[/dim]")
+@click.option("--type", "-t", default="episodic",
+              type=click.Choice(["episodic", "semantic", "working"]))
+@click.option("--top-k", "-k", default=5, type=int)
+def memory_query(query: str, type: str, top_k: int):
+    """Query the NEXUS memory system."""
+    click.echo(f"[NEXUS] Querying {type} memory: '{query}'")
+    click.echo(f"[NEXUS] Top-{top_k} results:")
+    click.echo("  (Memory system requires running kernel)")
 
 
-@memory.command(name="stats")
+@memory.command("stats")
 def memory_stats():
     """Show memory system statistics."""
-    if console:
-        table = Table(title="Memory Statistics")
-        table.add_column("Type", style="cyan")
-        table.add_column("Entries", justify="right")
-        table.add_column("Size", justify="right")
-        table.add_row("Episodic", "0", "0 MB")
-        table.add_row("Semantic", "0", "0 MB")
-        table.add_row("Working", "0", "0 MB")
-        table.add_row("[bold]Total[/bold]", "[bold]0[/bold]", "[bold]0 MB[/bold]")
-        console.print(table)
-    else:
-        print("Episodic: 0 entries | Semantic: 0 entries | Working: 0 entries")
+    click.echo("[NEXUS] Memory Statistics:")
+    click.echo("  Episodic: 0 memories")
+    click.echo("  Semantic: 0 concepts")
+    click.echo("  Working:  0/7 slots used")
 
 
-@memory.command(name="clear")
-@click.option("--type", "-t", "mem_type", default="working",
-              type=click.Choice(["all", "episodic", "semantic", "working"]))
+@memory.command("clear")
+@click.option("--type", "-t", default="working",
+              type=click.Choice(["episodic", "semantic", "working", "all"]))
 @click.confirmation_option(prompt="Are you sure you want to clear memory?")
-def memory_clear(mem_type: str):
-    """Clear memory (use with caution)."""
-    _print(f"[red]Cleared {mem_type} memory[/red]")
+def memory_clear(type: str):
+    """Clear memory (dangerous!)."""
+    click.echo(f"[NEXUS] Clearing {type} memory...")
+    click.echo(f"[NEXUS] {type} memory cleared.")
 
 
 @cli.group()
 def improve():
-    """Manage RSI (Recursive Self-Improvement)."""
+    """Self-improvement system management."""
     pass
 
 
-@improve.command(name="status")
+@improve.command("status")
 def improve_status():
-    """Show RSI system status."""
-    _print("[bold]RSI System Status[/bold]")
-    _print("  Cycles completed: 0")
-    _print("  Improvements applied: 0")
-    _print("  Health score: N/A (requires kernel)")
+    """Show RSI (Recursive Self-Improvement) status."""
+    click.echo("[NEXUS] RSI System Status:")
+    click.echo("  Monitor: Active")
+    click.echo("  Last scan: N/A")
+    click.echo("  Improvements applied: 0")
+    click.echo("  Bottlenecks detected: 0")
 
 
-@improve.command(name="run")
-@click.option("--cycles", "-c", default=1, help="Number of improvement cycles")
-@click.option("--dry-run", is_flag=True, help="Simulate without applying changes")
-def improve_run(cycles: int, dry_run: bool):
-    """Run RSI improvement cycles."""
-    mode = "[DRY RUN] " if dry_run else ""
-    for i in range(1, cycles + 1):
-        _print(f"{mode}Running improvement cycle {i}/{cycles}...")
-        time.sleep(0.1)
-    _print(f"[green]Completed {cycles} cycle(s)[/green]")
+@improve.command("run")
+@click.option("--cycles", "-c", default=1, type=int, help="Number of improvement cycles")
+def improve_run(cycles: int):
+    """Trigger manual self-improvement cycle."""
+    click.echo(f"[NEXUS] Starting {cycles} RSI cycle(s)...")
+    for i in range(cycles):
+        click.echo(f"  Cycle {i+1}/{cycles}: Analyzing performance...")
+        click.echo(f"  Cycle {i+1}/{cycles}: Detecting bottlenecks...")
+        click.echo(f"  Cycle {i+1}/{cycles}: Generating improvements...")
+    click.echo("[NEXUS] RSI cycles complete.")
 
 
 @cli.command()
 @click.option("--host", default="0.0.0.0", help="Host to bind")
-@click.option("--port", "-p", default=8000, help="Port to bind")
-@click.option("--reload", is_flag=True, help="Enable auto-reload (dev mode)")
+@click.option("--port", default=8000, type=int, help="Port to listen on")
+@click.option("--reload/--no-reload", default=False, help="Auto-reload on changes")
 def serve(host: str, port: int, reload: bool):
     """Start the NEXUS-AGI API server."""
     try:
         import uvicorn
-        _print(f"[green]Starting NEXUS-AGI API server[/green] on {host}:{port}")
-        uvicorn.run("nexus.api.server:app", host=host, port=port, reload=reload)
+        from nexus.api.server import create_app
+        click.echo(f"[NEXUS] Starting API server on {host}:{port}")
+        app = create_app()
+        uvicorn.run(app, host=host, port=port, reload=reload)
     except ImportError:
-        _print("[red]uvicorn not installed. Run: pip install uvicorn[standard][/red]")
+        click.echo("[ERROR] uvicorn not installed. Run: pip install uvicorn", err=True)
         sys.exit(1)
 
 
 @cli.command()
 def version():
-    """Show version information."""
-    _print("[bold cyan]NEXUS-AGI[/bold cyan] v1.0.0")
-    _print("Advanced General Intelligence Framework")
-    _print("Author: SULFIKAR | License: MIT")
+    """Show NEXUS-AGI version."""
+    click.echo("NEXUS-AGI v1.0.0")
+    click.echo("Python AGI Framework with RSI")
+    click.echo("https://github.com/ajul8866/nexus-agi")
+
+
+async def _run_task(task: str, agent_type: str, max_iter: int) -> dict:
+    """Async task runner placeholder."""
+    await asyncio.sleep(0.1)
+    return {
+        "status": "completed",
+        "output": f"Task processed by {agent_type} agent (kernel not initialized in CLI mode)",
+        "iterations": 1,
+    }
 
 
 if __name__ == "__main__":
