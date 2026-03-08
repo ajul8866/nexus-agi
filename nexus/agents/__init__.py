@@ -1,6 +1,10 @@
-from .base import AgentBase
-from .orchestrator import OrchestratorAgent
-from .specialist import SpecialistAgent
-from .reflection import ReflectionAgent
+"""NEXUS-AGI Agents package."""
+from nexus.agents.base import AgentBase, AgentState, AgentCapability
+from nexus.agents.orchestrator import OrchestratorAgent
+from nexus.agents.specialist import SpecialistAgent
+from nexus.agents.reflection import ReflectionAgent
 
-__all__ = ["AgentBase", "OrchestratorAgent", "SpecialistAgent", "ReflectionAgent"]
+__all__ = [
+    "AgentBase", "AgentState", "AgentCapability",
+    "OrchestratorAgent", "SpecialistAgent", "ReflectionAgent",
+]
