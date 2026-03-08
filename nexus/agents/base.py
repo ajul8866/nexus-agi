@@ -52,7 +52,12 @@ class AgentBase(ABC):
     Provides async execution loop, memory, tools, and messaging.
     """
 
-    def __init__(self, agent_id: Optional[str] = None, capabilities: Optional[List[AgentCapability]] = None, max_queue_size: int = 100):
+    def __init__(
+        self,
+        agent_id: Optional[str] = None,
+        capabilities: Optional[List[AgentCapability]] = None,
+        max_queue_size: int = 100,
+    ):
         self.agent_id = agent_id or str(uuid.uuid4())
         self.capabilities = capabilities or []
         self.state = AgentState(agent_id=self.agent_id)
@@ -63,6 +68,7 @@ class AgentBase(ABC):
         self._loop_task: Optional[asyncio.Task] = None
         logger.info("Agent created id=%s caps=%s", self.agent_id, [c.name for c in self.capabilities])
 
+    # ── Abstract interface ─────────────────────────────────────────────────────
     @abstractmethod
     async def perceive(self, input_data: Any) -> Any:
         """Process incoming percepts/messages."""
@@ -79,6 +85,7 @@ class AgentBase(ABC):
     async def reflect(self) -> Any:
         """Meta-cognitive reflection on recent actions."""
 
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
     async def start(self) -> None:
         self._running = True
         self.state.status = "running"
@@ -99,11 +106,14 @@ class AgentBase(ABC):
         self.state.status = "running"
         await self._execution_loop()
 
+    # ── Execution loop ─────────────────────────────────────────────────────────
     async def _execution_loop(self) -> None:
         while self._running:
             try:
                 try:
-                    raw_input = await asyncio.wait_for(self.message_queue.get(), timeout=1.0)
+                    raw_input = await asyncio.wait_for(
+                        self.message_queue.get(), timeout=1.0
+                    )
                 except asyncio.TimeoutError:
                     await asyncio.sleep(0.1)
                     continue
@@ -116,7 +126,13 @@ class AgentBase(ABC):
                 decision = await self.think(percept)
                 result = await self.act(decision)
 
-                self.state.task_history.append({"input": str(raw_input)[:200], "result": str(result)[:200], "timestamp": datetime.utcnow().isoformat()})
+                self.state.task_history.append(
+                    {
+                        "input": str(raw_input)[:200],
+                        "result": str(result)[:200],
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }
+                )
                 self.state.status = "idle"
                 self.state.current_task = None
                 self.message_queue.task_done()
@@ -126,14 +142,19 @@ class AgentBase(ABC):
             except Exception as exc:
                 logger.exception("Agent %s error: %s", self.agent_id, exc)
                 self.state.status = "error"
-                self.state.metrics["error_count"] = self.state.metrics.get("error_count", 0) + 1
+                self.state.metrics["error_count"] = (
+                    self.state.metrics.get("error_count", 0) + 1
+                )
                 await asyncio.sleep(0.5)
 
+    # ── Utilities ──────────────────────────────────────────────────────────────
     async def receive(self, message: Any) -> None:
+        """Put a message onto this agent's queue."""
         await self.message_queue.put(message)
 
     def register_tool(self, name: str, func: Any, description: str = "") -> None:
         self.tool_registry[name] = {"func": func, "description": description}
+        logger.debug("Agent %s registered tool: %s", self.agent_id, name)
 
     async def use_tool(self, name: str, **kwargs) -> Any:
         if name not in self.tool_registry:
