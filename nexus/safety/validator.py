@@ -57,11 +57,13 @@ class ActionValidator:
         self._validators: List[Callable[[ActionSpec], Optional[ValidationResult]]] = []
 
     def validate(self, action: ActionSpec) -> ValidationResult:
+        # Run custom validators first
         for validator in self._validators:
             result = validator(action)
             if result is not None:
                 return result
 
+        # Check action type risk
         risk = self._assess_risk(action)
 
         if risk == ActionRisk.CRITICAL:
