@@ -105,12 +105,14 @@ class NexusKernel:
         }
         logger.info("NexusKernel initialised  id=%s", self.kernel_id)
 
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
     async def start(self) -> None:
         if self._running:
             logger.warning("Kernel already running")
             return
         self._running = True
         logger.info("NexusKernel STARTING")
+        # Start all registered agents
         for rec in self._agents.values():
             await self._start_agent(rec)
         logger.info("NexusKernel RUNNING with %d agents", len(self._agents))
@@ -133,6 +135,7 @@ class NexusKernel:
             task = asyncio.create_task(rec.instance.start(), name=rec.agent_id)
             self._tasks.append(task)
 
+    # ── Agent registry ─────────────────────────────────────────────────────────
     def register_agent(self, agent_instance: Any, agent_type: str = "generic") -> str:
         if len(self._agents) >= self.max_agents:
             raise RuntimeError(f"Max agent limit reached: {self.max_agents}")
@@ -162,19 +165,35 @@ class NexusKernel:
     def list_agents(self) -> List[AgentRecord]:
         return list(self._agents.values())
 
-    async def send_message(self, sender: str, recipient: str, topic: str, payload: Any, priority: int = 0) -> Message:
-        msg = Message(sender=sender, recipient=recipient, topic=topic, payload=payload, priority=priority)
+    # ── Messaging ──────────────────────────────────────────────────────────────
+    async def send_message(
+        self,
+        sender: str,
+        recipient: str,
+        topic: str,
+        payload: Any,
+        priority: int = 0,
+    ) -> Message:
+        msg = Message(
+            sender=sender,
+            recipient=recipient,
+            topic=topic,
+            payload=payload,
+            priority=priority,
+        )
         await self.message_bus.publish(msg)
         return msg
 
     async def broadcast(self, sender: str, topic: str, payload: Any) -> Message:
         return await self.send_message(sender, "", topic, payload)
 
+    # ── Hooks ──────────────────────────────────────────────────────────────────
     def add_hook(self, event: str, callback: Callable) -> None:
         if event not in self._hooks:
             raise ValueError(f"Unknown event: {event}")
         self._hooks[event].append(callback)
 
+    # ── Status ─────────────────────────────────────────────────────────────────
     def status(self) -> Dict[str, Any]:
         return {
             "kernel_id": self.kernel_id,
@@ -183,7 +202,12 @@ class NexusKernel:
             "max_agents": self.max_agents,
             "message_history": len(self.message_bus._history),
             "agents": [
-                {"id": r.agent_id, "type": r.agent_type, "lifecycle": r.lifecycle.name, "tasks": r.task_count}
+                {
+                    "id": r.agent_id,
+                    "type": r.agent_type,
+                    "lifecycle": r.lifecycle.name,
+                    "tasks": r.task_count,
+                }
                 for r in self._agents.values()
             ],
         }
