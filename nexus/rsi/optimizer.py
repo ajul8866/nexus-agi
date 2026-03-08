@@ -27,14 +27,17 @@ class PromptOptimizer:
     STRATEGIES = ["more_specific", "add_examples", "restructure", "add_constraints", "simplify"]
 
     def __init__(self):
-        self._library: Dict[str, List[PromptTemplate]] = {}
+        self._library: Dict[str, List[PromptTemplate]] = {}  # task_type -> templates
         self._pattern_library: Dict[str, List[str]] = {}
         self._generation = 0
 
-    def register_prompt(self, content: str, task_type: str, score: float = 0.5) -> PromptTemplate:
+    def register_prompt(self, content: str, task_type: str,
+                        score: float = 0.5) -> PromptTemplate:
         pt = PromptTemplate(
             id=f"pt_{task_type}_{int(time.time()*1000)}",
-            content=content, task_type=task_type, score=score
+            content=content,
+            task_type=task_type,
+            score=score
         )
         self._library.setdefault(task_type, []).append(pt)
         return pt
@@ -43,16 +46,22 @@ class PromptOptimizer:
                         history: Optional[List[Dict]] = None) -> str:
         history = history or []
         templates = self._library.get(task_type, [])
+
+        # If we have high-scoring templates, blend with base
         if templates:
             best = max(templates, key=lambda t: t.score)
             if best.score > 0.7:
                 return self._blend_prompts(base_prompt, best.content)
+
+        # Apply best strategy from history
         if history:
             successful = [h for h in history if h.get("success")]
             if successful:
                 patterns = self.extract_patterns([h["prompt"] for h in successful])
                 if patterns:
                     return self._apply_patterns(base_prompt, patterns)
+
+        # Default: apply random improvement strategy
         strategy = random.choice(self.STRATEGIES)
         return self.generate_variant(base_prompt, strategy)
 
@@ -78,19 +87,25 @@ class PromptOptimizer:
         avg_b = sum(scores_b) / len(scores_b) if scores_b else 0
         winner = "A" if avg_a >= avg_b else "B"
         winning_prompt = prompt_a if winner == "A" else prompt_b
-        return {"winner": winner, "winning_prompt": winning_prompt,
-                "score_a": round(avg_a, 3), "score_b": round(avg_b, 3),
-                "improvement": round(abs(avg_a - avg_b), 3)}
+        return {
+            "winner": winner,
+            "winning_prompt": winning_prompt,
+            "score_a": round(avg_a, 3),
+            "score_b": round(avg_b, 3),
+            "improvement": round(abs(avg_a - avg_b), 3)
+        }
 
     def extract_patterns(self, successful_prompts: List[str]) -> List[str]:
         if not successful_prompts:
             return []
+        # Find common phrases (simple frequency analysis)
         word_freq: Dict[str, int] = {}
         for prompt in successful_prompts:
             words = prompt.lower().split()
             for w in words:
-                if len(w) > 4:
+                if len(w) > 4:  # skip short words
                     word_freq[w] = word_freq.get(w, 0) + 1
+        # Patterns = words appearing in >50% of prompts
         threshold = len(successful_prompts) * 0.5
         patterns = [w for w, count in word_freq.items() if count >= threshold]
         self._pattern_library["common"] = patterns
@@ -99,6 +114,7 @@ class PromptOptimizer:
     def _blend_prompts(self, base: str, template: str) -> str:
         base_lines = base.strip().split("\n")
         template_lines = template.strip().split("\n")
+        # Keep first half of base + last quarter of template
         blended = base_lines + [""] + template_lines[-max(1, len(template_lines)//4):]
         return "\n".join(blended)
 
