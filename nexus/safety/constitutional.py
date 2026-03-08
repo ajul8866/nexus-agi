@@ -126,12 +126,14 @@ class ConstitutionalAI:
             matched = False
             matched_content = ""
 
+            # Check keywords
             for keyword in rule.keywords:
                 if keyword.lower() in content_lower:
                     matched = True
                     matched_content = keyword
                     break
 
+            # Check regex patterns
             if not matched:
                 for pattern in self._compiled_patterns.get(rule.id, []):
                     match = pattern.search(content)
@@ -151,7 +153,9 @@ class ConstitutionalAI:
                     suggestion=f"Remove or rephrase content related to: {rule.name}",
                 ))
 
+        has_critical = any(v.severity == Severity.CRITICAL.value for v in violations)
         is_safe = len(violations) == 0
+
         return is_safe, violations
 
     def add_rule(self, rule: ConstitutionalRule):
