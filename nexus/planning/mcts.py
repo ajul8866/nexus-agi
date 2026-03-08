@@ -1,4 +1,4 @@
-"""MonteCarloTreeSearch - MCTS planning for decision making under uncertainty."""
+"""MonteCarloTreeSearch - UCT-based planning with expansion, simulation, backprop."""
 
 import logging
 import math
@@ -9,143 +9,236 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("nexus.planning.mcts")
 
+UCT_CONSTANT = math.sqrt(2)
+
 
 @dataclass
 class MCTSNode:
     node_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     state: Any = None
-    action: Optional[str] = None
-    parent: Optional["MCTSNode"] = None
-    children: List["MCTSNode"] = field(default_factory=list)
-    visits: int = 0
-    value: float = 0.0
+    action: Optional[str] = None      # action that led to this state
+    parent_id: Optional[str] = None
+    children: List[str] = field(default_factory=list)
+    visit_count: int = 0
+    total_reward: float = 0.0
+    is_terminal: bool = False
     untried_actions: List[str] = field(default_factory=list)
-    depth: int = 0
+
+    @property
+    def avg_reward(self) -> float:
+        return self.total_reward / max(self.visit_count, 1)
+
+    def uct_score(self, parent_visits: int, c: float = UCT_CONSTANT) -> float:
+        """Upper Confidence Bound for Trees (UCT)."""
+        if self.visit_count == 0:
+            return float("inf")
+        exploitation = self.avg_reward
+        exploration = c * math.sqrt(math.log(max(parent_visits, 1)) / self.visit_count)
+        return exploitation + exploration
 
     def is_fully_expanded(self) -> bool:
         return len(self.untried_actions) == 0
 
-    def is_terminal(self) -> bool:
-        return len(self.children) == 0 and self.is_fully_expanded()
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "action": self.action,
+            "visits": self.visit_count,
+            "avg_reward": round(self.avg_reward, 4),
+            "children": len(self.children),
+            "is_terminal": self.is_terminal,
+        }
 
-    def ucb1(self, exploration: float = 1.414) -> float:
-        if self.visits == 0:
-            return float("inf")
-        if self.parent is None or self.parent.visits == 0:
-            return self.value / self.visits
-        return (self.value / self.visits) + exploration * math.sqrt(math.log(self.parent.visits) / self.visits)
 
-    def best_child(self, exploration: float = 1.414) -> "MCTSNode":
-        return max(self.children, key=lambda c: c.ucb1(exploration))
+@dataclass
+class MCTSResult:
+    best_action: Optional[str]
+    best_node_id: str
+    iterations: int
+    nodes_created: int
+    root_visits: int
+    best_avg_reward: float
 
-    def most_visited_child(self) -> "MCTSNode":
-        return max(self.children, key=lambda c: c.visits)
-
-    def add_child(self, action: str, state: Any) -> "MCTSNode":
-        child = MCTSNode(state=state, action=action, parent=self, depth=self.depth + 1)
-        self.children.append(child)
-        return child
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "best_action": self.best_action,
+            "iterations": self.iterations,
+            "nodes_created": self.nodes_created,
+            "root_visits": self.root_visits,
+            "best_avg_reward": round(self.best_avg_reward, 4),
+        }
 
 
 class MonteCarloTreeSearch:
     """
-    Generic MCTS implementation.
-    Requires caller-supplied callbacks:
-      - get_actions(state) -> List[str]
-      - apply_action(state, action) -> new_state
-      - is_terminal(state) -> bool
-      - evaluate(state) -> float  (0.0 = worst, 1.0 = best)
+    MCTS with UCT selection strategy.
+    Requires:
+    - get_actions(state) -> List[str]
+    - apply_action(state, action) -> new_state
+    - is_terminal(state) -> bool
+    - simulate(state) -> float (reward 0.0 – 1.0)
     """
 
     def __init__(
         self,
-        get_actions: Callable,
-        apply_action: Callable,
-        is_terminal: Callable,
-        evaluate: Callable,
-        iterations: int = 1000,
-        max_depth: int = 20,
-        exploration: float = 1.414,
-        rollout_depth: int = 10,
+        iterations: int = 100,
+        uct_constant: float = UCT_CONSTANT,
+        max_simulation_depth: int = 20,
+        seed: Optional[int] = None,
     ):
-        self.get_actions = get_actions
-        self.apply_action = apply_action
-        self.is_terminal = is_terminal
-        self.evaluate = evaluate
         self.iterations = iterations
-        self.max_depth = max_depth
-        self.exploration = exploration
-        self.rollout_depth = rollout_depth
-        self._root: Optional[MCTSNode] = None
-        self._stats: Dict[str, int] = {"selections": 0, "expansions": 0, "rollouts": 0, "backprops": 0}
+        self.uct_constant = uct_constant
+        self.max_simulation_depth = max_simulation_depth
+        self._rng = random.Random(seed)
+        self._nodes: Dict[str, MCTSNode] = {}
 
-    def search(self, initial_state: Any) -> Tuple[Optional[str], MCTSNode]:
-        actions = self.get_actions(initial_state)
-        self._root = MCTSNode(state=initial_state, untried_actions=list(actions))
-
-        for _ in range(self.iterations):
-            node = self._select(self._root)
-            if not self.is_terminal(node.state) and not node.is_fully_expanded():
-                node = self._expand(node)
-            reward = self._rollout(node)
-            self._backpropagate(node, reward)
-
-        if not self._root.children:
-            return None, self._root
-
-        best = self._root.most_visited_child()
-        logger.info("MCTS search done: iterations=%d best_action=%s visits=%d value=%.3f",
-                    self.iterations, best.action, best.visits, best.value / max(best.visits, 1))
-        return best.action, self._root
-
-    def _select(self, node: MCTSNode) -> MCTSNode:
-        self._stats["selections"] += 1
-        current = node
-        while not self.is_terminal(current.state) and current.is_fully_expanded() and current.children:
-            current = current.best_child(self.exploration)
-            if current.depth >= self.max_depth:
+    # ── Core MCTS phases ──────────────────────────────────────────────────────────
+    def _selection(self, node: MCTSNode) -> MCTSNode:
+        """Select best child using UCT until a non-fully-expanded node is reached."""
+        while node.is_fully_expanded() and node.children and not node.is_terminal:
+            child_nodes = [self._nodes[cid] for cid in node.children if cid in self._nodes]
+            if not child_nodes:
                 break
-        return current
+            node = max(child_nodes, key=lambda c: c.uct_score(node.visit_count, self.uct_constant))
+        return node
 
-    def _expand(self, node: MCTSNode) -> MCTSNode:
-        self._stats["expansions"] += 1
-        action = node.untried_actions.pop(random.randrange(len(node.untried_actions)))
-        new_state = self.apply_action(node.state, action)
-        child = node.add_child(action, new_state)
-        new_actions = self.get_actions(new_state)
-        child.untried_actions = list(new_actions)
+    def _expansion(
+        self,
+        node: MCTSNode,
+        apply_action: Callable,
+        get_actions: Callable,
+        is_terminal: Callable,
+    ) -> MCTSNode:
+        """Expand one untried action from the node."""
+        if not node.untried_actions or node.is_terminal:
+            return node
+
+        action = node.untried_actions.pop(self._rng.randint(0, len(node.untried_actions) - 1))
+        new_state = apply_action(node.state, action)
+        terminal = is_terminal(new_state)
+
+        child = MCTSNode(
+            state=new_state,
+            action=action,
+            parent_id=node.node_id,
+            is_terminal=terminal,
+            untried_actions=get_actions(new_state) if not terminal else [],
+        )
+        self._nodes[child.node_id] = child
+        node.children.append(child.node_id)
         return child
 
-    def _rollout(self, node: MCTSNode) -> float:
-        self._stats["rollouts"] += 1
-        state = node.state
-        depth = 0
-        while not self.is_terminal(state) and depth < self.rollout_depth:
-            actions = self.get_actions(state)
+    def _simulation(
+        self,
+        state: Any,
+        apply_action: Callable,
+        get_actions: Callable,
+        is_terminal: Callable,
+        simulate: Callable,
+    ) -> float:
+        """Run a random rollout from state and return reward."""
+        current_state = state
+        for _ in range(self.max_simulation_depth):
+            if is_terminal(current_state):
+                break
+            actions = get_actions(current_state)
             if not actions:
                 break
-            action = random.choice(actions)
-            state = self.apply_action(state, action)
-            depth += 1
-        return self.evaluate(state)
+            action = self._rng.choice(actions)
+            current_state = apply_action(current_state, action)
+        return simulate(current_state)
 
-    def _backpropagate(self, node: MCTSNode, reward: float) -> None:
-        self._stats["backprops"] += 1
+    def _backpropagation(self, node: MCTSNode, reward: float) -> None:
+        """Propagate reward up the tree."""
         current: Optional[MCTSNode] = node
-        while current is not None:
-            current.visits += 1
-            current.value += reward
-            current = current.parent
+        while current:
+            current.visit_count += 1
+            current.total_reward += reward
+            current = self._nodes.get(current.parent_id) if current.parent_id else None
 
-    def get_action_values(self) -> List[Dict[str, Any]]:
-        if not self._root:
-            return []
-        return sorted(
-            [{"action": c.action, "visits": c.visits, "avg_value": round(c.value / max(c.visits, 1), 4), "ucb1": round(c.ucb1(self.exploration), 4)} for c in self._root.children],
-            key=lambda x: x["visits"], reverse=True
+    # ── Main search ──────────────────────────────────────────────────────────────────
+    def search(
+        self,
+        initial_state: Any,
+        get_actions: Callable[[Any], List[str]],
+        apply_action: Callable[[Any, str], Any],
+        is_terminal: Callable[[Any], bool],
+        simulate: Callable[[Any], float],
+        iterations: Optional[int] = None,
+    ) -> MCTSResult:
+        """Run MCTS and return the best action from the root."""
+        iters = iterations or self.iterations
+        self._nodes.clear()
+
+        root = MCTSNode(
+            state=initial_state,
+            action=None,
+            is_terminal=is_terminal(initial_state),
+            untried_actions=get_actions(initial_state),
+        )
+        self._nodes[root.node_id] = root
+
+        for i in range(iters):
+            node = self._selection(root)
+            if not node.is_terminal and not node.is_fully_expanded():
+                node = self._expansion(node, apply_action, get_actions, is_terminal)
+            reward = self._simulation(
+                node.state, apply_action, get_actions, is_terminal, simulate
+            )
+            self._backpropagation(node, reward)
+
+        best_child: Optional[MCTSNode] = None
+        if root.children:
+            child_nodes = [self._nodes[cid] for cid in root.children if cid in self._nodes]
+            best_child = max(child_nodes, key=lambda c: c.avg_reward)
+
+        return MCTSResult(
+            best_action=best_child.action if best_child else None,
+            best_node_id=best_child.node_id if best_child else root.node_id,
+            iterations=iters,
+            nodes_created=len(self._nodes),
+            root_visits=root.visit_count,
+            best_avg_reward=best_child.avg_reward if best_child else 0.0,
         )
 
-    def tree_stats(self) -> Dict[str, Any]:
-        if not self._root:
-            return {}
-        return {"iterations": self.iterations, "root_visits": self._root.visits, "children": len(self._root.children), "search_stats": self._stats, "action_values": self.get_action_values()[:5]}
+    # ── Action selection policies ───────────────────────────────────────────────────────
+    def select_action_robust(self) -> Optional[str]:
+        """Robust child: most visited (less variance than max reward)."""
+        root = next((n for n in self._nodes.values() if n.parent_id is None), None)
+        if not root or not root.children:
+            return None
+        child_nodes = [self._nodes[cid] for cid in root.children if cid in self._nodes]
+        best = max(child_nodes, key=lambda c: c.visit_count)
+        return best.action
+
+    # ── Stats ──────────────────────────────────────────────────────────────────
+    def stats(self) -> Dict[str, Any]:
+        nodes = list(self._nodes.values())
+        return {
+            "total_nodes": len(nodes),
+            "iterations": self.iterations,
+            "uct_constant": self.uct_constant,
+            "avg_visits": round(sum(n.visit_count for n in nodes) / max(len(nodes), 1), 2),
+            "avg_reward": round(sum(n.avg_reward for n in nodes) / max(len(nodes), 1), 4),
+        }
+
+    # ── Demo helper ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def demo_problem() -> MCTSResult:
+        """Run MCTS on a simple numerical maximisation problem."""
+        import random as _r
+
+        def get_actions(state: int) -> List[str]:
+            return ["+1", "+2", "+3", "-1"] if state < 10 else []
+
+        def apply_action(state: int, action: str) -> int:
+            return state + int(action)
+
+        def is_terminal(state: int) -> bool:
+            return state >= 10
+
+        def simulate(state: int) -> float:
+            return state / 10.0
+
+        mcts = MonteCarloTreeSearch(iterations=50, seed=42)
+        return mcts.search(0, get_actions, apply_action, is_terminal, simulate)
