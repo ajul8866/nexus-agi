@@ -4,10 +4,11 @@ import json
 import logging
 import math
 import sqlite3
+import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("nexus.memory.episodic")
 
@@ -18,68 +19,145 @@ class Episode:
     event: str = ""
     context: Dict[str, Any] = field(default_factory=dict)
     outcome: Optional[str] = None
-    importance: float = 0.5
+    importance: float = 0.5          # 0.0 – 1.0
     timestamp: datetime = field(default_factory=datetime.utcnow)
     recall_count: int = 0
     last_recalled: Optional[datetime] = None
     tags: List[str] = field(default_factory=list)
 
+    # Ebbinghaus forgetting curve: R = e^(-t/S)
     def retention(self, stability: float = 24.0) -> float:
+        """Memory retention at current time (0-1)."""
         hours_elapsed = (datetime.utcnow() - self.timestamp).total_seconds() / 3600
         raw = math.exp(-hours_elapsed / max(stability, 0.1))
+        # Boost by recall count (spaced repetition effect)
         boost = min(self.recall_count * 0.05, 0.5)
         return min(1.0, raw + boost)
 
     def relevance_score(self, query_tags: List[str], stability: float = 24.0) -> float:
+        """Combined relevance: tag overlap + importance + retention."""
         if not query_tags:
             return self.importance * self.retention(stability)
         overlap = len(set(self.tags) & set(query_tags)) / max(len(query_tags), 1)
         return 0.4 * overlap + 0.3 * self.importance + 0.3 * self.retention(stability)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"episode_id": self.episode_id, "event": self.event, "context": self.context, "outcome": self.outcome, "importance": self.importance, "timestamp": self.timestamp.isoformat(), "recall_count": self.recall_count, "tags": self.tags, "retention": round(self.retention(), 3)}
+        return {
+            "episode_id": self.episode_id,
+            "event": self.event,
+            "context": self.context,
+            "outcome": self.outcome,
+            "importance": self.importance,
+            "timestamp": self.timestamp.isoformat(),
+            "recall_count": self.recall_count,
+            "tags": self.tags,
+            "retention": round(self.retention(), 3),
+        }
 
 
 class EpisodicMemory:
-    """Episodic memory with in-memory storage, optional SQLite persistence, Ebbinghaus forgetting curve, and memory consolidation."""
+    """
+    Episodic memory with:
+    - In-memory storage (fast access)
+    - Optional SQLite persistence
+    - Ebbinghaus forgetting curve
+    - Retrieval by time, similarity, and relevance
+    - Memory consolidation (prune low-retention episodes)
+    """
 
-    def __init__(self, capacity: int = 10000, db_path: Optional[str] = None, forgetting_stability: float = 24.0):
+    def __init__(
+        self,
+        capacity: int = 10000,
+        db_path: Optional[str] = None,
+        forgetting_stability: float = 24.0,
+    ):
         self.capacity = capacity
         self.forgetting_stability = forgetting_stability
         self._episodes: Dict[str, Episode] = {}
         self._db: Optional[sqlite3.Connection] = None
+
         if db_path:
             self._init_db(db_path)
 
+    # ── Persistence ────────────────────────────────────────────────────────────
     def _init_db(self, db_path: str) -> None:
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.execute("""CREATE TABLE IF NOT EXISTS episodes (episode_id TEXT PRIMARY KEY, event TEXT, context TEXT, outcome TEXT, importance REAL, timestamp TEXT, recall_count INTEGER, tags TEXT)""")
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS episodes (
+                episode_id TEXT PRIMARY KEY,
+                event TEXT,
+                context TEXT,
+                outcome TEXT,
+                importance REAL,
+                timestamp TEXT,
+                recall_count INTEGER,
+                tags TEXT
+            )
+        """)
         self._db.commit()
         self._load_from_db()
+        logger.info("EpisodicMemory DB initialised: %s", db_path)
 
     def _load_from_db(self) -> None:
         if not self._db:
             return
         cur = self._db.execute("SELECT * FROM episodes ORDER BY timestamp DESC LIMIT ?", (self.capacity,))
         for row in cur.fetchall():
-            ep = Episode(episode_id=row[0], event=row[1], context=json.loads(row[2] or "{}"), outcome=row[3], importance=row[4], timestamp=datetime.fromisoformat(row[5]), recall_count=row[6], tags=json.loads(row[7] or "[]"))
+            ep = Episode(
+                episode_id=row[0],
+                event=row[1],
+                context=json.loads(row[2] or "{}"),
+                outcome=row[3],
+                importance=row[4],
+                timestamp=datetime.fromisoformat(row[5]),
+                recall_count=row[6],
+                tags=json.loads(row[7] or "[]"),
+            )
             self._episodes[ep.episode_id] = ep
 
     def _persist_episode(self, ep: Episode) -> None:
         if not self._db:
             return
-        self._db.execute("INSERT OR REPLACE INTO episodes (episode_id, event, context, outcome, importance, timestamp, recall_count, tags) VALUES (?,?,?,?,?,?,?,?)", (ep.episode_id, ep.event, json.dumps(ep.context), ep.outcome, ep.importance, ep.timestamp.isoformat(), ep.recall_count, json.dumps(ep.tags)))
+        self._db.execute("""
+            INSERT OR REPLACE INTO episodes
+            (episode_id, event, context, outcome, importance, timestamp, recall_count, tags)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            ep.episode_id,
+            ep.event,
+            json.dumps(ep.context),
+            ep.outcome,
+            ep.importance,
+            ep.timestamp.isoformat(),
+            ep.recall_count,
+            json.dumps(ep.tags),
+        ))
         self._db.commit()
 
+    # ── CRUD ───────────────────────────────────────────────────────────────────
     def store(self, episode: Episode) -> str:
         if len(self._episodes) >= self.capacity:
             self._evict_oldest()
         self._episodes[episode.episode_id] = episode
         self._persist_episode(episode)
+        logger.debug("Stored episode id=%s event=%.40s", episode.episode_id, episode.event)
         return episode.episode_id
 
-    def add(self, event: str, context: Optional[Dict[str, Any]] = None, outcome: Optional[str] = None, importance: float = 0.5, tags: Optional[List[str]] = None) -> Episode:
-        ep = Episode(event=event, context=context or {}, outcome=outcome, importance=importance, tags=tags or [])
+    def add(
+        self,
+        event: str,
+        context: Optional[Dict[str, Any]] = None,
+        outcome: Optional[str] = None,
+        importance: float = 0.5,
+        tags: Optional[List[str]] = None,
+    ) -> Episode:
+        ep = Episode(
+            event=event,
+            context=context or {},
+            outcome=outcome,
+            importance=importance,
+            tags=tags or [],
+        )
         self.store(ep)
         return ep
 
@@ -99,8 +177,12 @@ class EpisodicMemory:
             return True
         return False
 
+    # ── Retrieval ──────────────────────────────────────────────────────────────
     def retrieve_by_tags(self, tags: List[str], top_k: int = 10) -> List[Episode]:
-        scored = [(ep, ep.relevance_score(tags, self.forgetting_stability)) for ep in self._episodes.values()]
+        scored = [
+            (ep, ep.relevance_score(tags, self.forgetting_stability))
+            for ep in self._episodes.values()
+        ]
         scored.sort(key=lambda x: x[1], reverse=True)
         results = [ep for ep, _ in scored[:top_k]]
         for ep in results:
@@ -119,15 +201,23 @@ class EpisodicMemory:
         return important[:limit]
 
     def search(self, query: str, top_k: int = 10) -> List[Episode]:
+        """Simple substring search over event text."""
         q = query.lower()
         matched = [ep for ep in self._episodes.values() if q in ep.event.lower()]
         matched.sort(key=lambda e: e.importance * e.retention(self.forgetting_stability), reverse=True)
         return matched[:top_k]
 
+    # ── Consolidation ──────────────────────────────────────────────────────────
     def consolidate(self, retention_threshold: float = 0.05) -> int:
-        to_delete = [eid for eid, ep in self._episodes.items() if ep.retention(self.forgetting_stability) < retention_threshold and ep.importance < 0.8]
+        """Remove episodes below retention threshold (forget them)."""
+        to_delete = [
+            eid for eid, ep in self._episodes.items()
+            if ep.retention(self.forgetting_stability) < retention_threshold
+            and ep.importance < 0.8
+        ]
         for eid in to_delete:
             self.delete(eid)
+        logger.info("Consolidated: removed %d low-retention episodes", len(to_delete))
         return len(to_delete)
 
     def _evict_oldest(self) -> None:
@@ -136,7 +226,14 @@ class EpisodicMemory:
         oldest_id = min(self._episodes, key=lambda k: self._episodes[k].timestamp)
         self.delete(oldest_id)
 
+    # ── Stats ──────────────────────────────────────────────────────────────────
     def stats(self) -> Dict[str, Any]:
         episodes = list(self._episodes.values())
         avg_retention = sum(e.retention(self.forgetting_stability) for e in episodes) / max(len(episodes), 1)
-        return {"total_episodes": len(episodes), "capacity": self.capacity, "avg_retention": round(avg_retention, 3), "avg_importance": round(sum(e.importance for e in episodes) / max(len(episodes), 1), 3), "has_db": self._db is not None}
+        return {
+            "total_episodes": len(episodes),
+            "capacity": self.capacity,
+            "avg_retention": round(avg_retention, 3),
+            "avg_importance": round(sum(e.importance for e in episodes) / max(len(episodes), 1), 3),
+            "has_db": self._db is not None,
+        }
