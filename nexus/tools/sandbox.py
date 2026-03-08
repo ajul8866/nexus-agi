@@ -1,136 +1,162 @@
 """
 NEXUS-AGI Sandbox
-Secure execution environment for tool calls
+Safe Python code execution environment
 """
 from __future__ import annotations
+import io
+import sys
 import time
-import uuid
-import threading
+import ast
+import traceback
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
-from enum import Enum
-
-
-class SandboxStatus(Enum):
-    IDLE = "idle"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    TIMEOUT = "timeout"
-    ERROR = "error"
+from typing import Any, Dict, Optional
 
 
 @dataclass
-class SandboxResult:
-    sandbox_id: str
+class ExecutionResult:
     success: bool
-    output: Any
-    error: Optional[str]
-    status: str
-    execution_time: float
-    resource_usage: Dict[str, Any] = field(default_factory=dict)
+    output: str
+    return_value: Any
+    error: Optional[str] = None
+    execution_time: float = 0.0
+    stdout: str = ""
+    stderr: str = ""
+
+
+BLOCKED_BUILTINS = {
+    "exec", "eval", "compile", "__import__", "open", "input",
+    "memoryview", "breakpoint"
+}
+
+BLOCKED_MODULES = {
+    "os", "sys", "subprocess", "socket", "urllib", "http",
+    "shutil", "pickle", "marshal", "importlib", "ctypes", "multiprocessing"
+}
+
+SAFE_BUILTINS = {
+    "abs", "all", "any", "bin", "bool", "chr", "dict", "dir",
+    "divmod", "enumerate", "filter", "float", "format", "frozenset",
+    "getattr", "hasattr", "hash", "hex", "int", "isinstance",
+    "issubclass", "iter", "len", "list", "map", "max", "min",
+    "next", "oct", "ord", "pow", "print", "range", "repr",
+    "reversed", "round", "set", "slice", "sorted", "str", "sum",
+    "tuple", "type", "vars", "zip", "True", "False", "None",
+    "Exception", "ValueError", "TypeError", "KeyError", "IndexError"
+}
 
 
 class Sandbox:
-    """
-    Isolated execution environment for tool calls.
-    Provides timeout control, resource limits, and audit logging.
-    """
+    """Sandboxed Python execution with resource limits."""
 
-    DEFAULT_TIMEOUT = 30.0
-    MAX_MEMORY_MB = 512
+    def __init__(self, max_output_size: int = 10_000):
+        self._max_output_size = max_output_size
+        self._execution_count = 0
 
-    def __init__(self, max_concurrent: int = 10,
-                 default_timeout: float = 30.0):
-        self._max_concurrent = max_concurrent
-        self._default_timeout = default_timeout
-        self._active_executions: Dict[str, Dict] = {}
-        self._audit_log: List[Dict[str, Any]] = []
-        self._semaphore = threading.Semaphore(max_concurrent)
-
-    def execute(self, func: Callable, args: tuple = (),
-                kwargs: Dict = None, timeout: Optional[float] = None,
-                sandbox_id: Optional[str] = None) -> SandboxResult:
-        """Execute function in isolated sandbox with timeout."""
-        sid = sandbox_id or f"sbx_{uuid.uuid4().hex[:8]}"
-        kwargs = kwargs or {}
-        timeout = timeout or self._default_timeout
+    def execute_code(self, code: str, timeout: float = 10.0,
+                     extra_globals: Optional[Dict] = None) -> ExecutionResult:
         start = time.time()
+        self._execution_count += 1
 
-        if not self._semaphore.acquire(timeout=5.0):
-            return SandboxResult(
-                sandbox_id=sid, success=False, output=None,
-                error="Max concurrent executions reached",
-                status=SandboxStatus.ERROR.value, execution_time=0.0
+        # AST safety check
+        safety_check = self._check_safety(code)
+        if not safety_check["safe"]:
+            return ExecutionResult(
+                success=False, output="", return_value=None,
+                error=f"Safety violation: {safety_check['reason']}"
             )
 
-        self._active_executions[sid] = {
-            "func": func.__name__, "start": start, "status": SandboxStatus.RUNNING.value
+        # Prepare safe globals
+        safe_globals = {
+            "__builtins__": {k: __builtins__[k] if isinstance(__builtins__, dict)
+                             else getattr(__builtins__, k, None)
+                             for k in SAFE_BUILTINS
+                             if (isinstance(__builtins__, dict) and k in __builtins__)
+                             or hasattr(__builtins__, k)},
+            "__name__": "__sandbox__",
         }
+        if extra_globals:
+            safe_globals.update(extra_globals)
 
-        result_container = {"output": None, "error": None, "done": False}
+        # Capture stdout
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        return_value = None
 
-        def run():
+        try:
+            sys.stdout = captured_stdout
+            sys.stderr = captured_stderr
+            exec(compile(code, "<sandbox>", "exec"), safe_globals)  # noqa: S102
+            # Try to get last expression value
             try:
-                result_container["output"] = func(*args, **kwargs)
-                result_container["done"] = True
-            except Exception as e:
-                result_container["error"] = str(e)
-                result_container["done"] = True
+                tree = ast.parse(code, mode="exec")
+                if tree.body and isinstance(tree.body[-1], ast.Expr):
+                    return_value = eval(  # noqa: S307
+                        compile(ast.Expression(body=tree.body[-1].value), "<sandbox>", "eval"),
+                        safe_globals
+                    )
+            except Exception:
+                pass
+        except Exception as e:
+            err = traceback.format_exc()
+            return ExecutionResult(
+                success=False,
+                output=captured_stdout.getvalue()[:self._max_output_size],
+                return_value=None,
+                error=err[:2000],
+                execution_time=time.time() - start,
+                stdout=captured_stdout.getvalue()[:self._max_output_size],
+                stderr=captured_stderr.getvalue()[:1000]
+            )
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 
-        thread = threading.Thread(target=run, daemon=True)
-        thread.start()
-        thread.join(timeout=timeout)
-
-        exec_time = time.time() - start
-        self._semaphore.release()
-        self._active_executions.pop(sid, None)
-
-        if not result_container["done"]:
-            status = SandboxStatus.TIMEOUT.value
-            success = False
-            error = f"Execution timed out after {timeout}s"
-            output = None
-        elif result_container["error"]:
-            status = SandboxStatus.ERROR.value
-            success = False
-            error = result_container["error"]
-            output = None
-        else:
-            status = SandboxStatus.COMPLETED.value
-            success = True
-            error = None
-            output = result_container["output"]
-
-        sbx_result = SandboxResult(
-            sandbox_id=sid, success=success, output=output,
-            error=error, status=status, execution_time=round(exec_time, 3)
+        stdout_val = captured_stdout.getvalue()[:self._max_output_size]
+        return ExecutionResult(
+            success=True,
+            output=stdout_val,
+            return_value=self._serialize(return_value),
+            execution_time=round(time.time() - start, 4),
+            stdout=stdout_val,
+            stderr=captured_stderr.getvalue()[:1000]
         )
-        self._audit_log.append({
-            "sandbox_id": sid, "func": func.__name__,
-            "status": status, "execution_time": exec_time,
-            "timestamp": time.time()
-        })
-        return sbx_result
 
-    def get_active_count(self) -> int:
-        return len(self._active_executions)
+    def _check_safety(self, code: str) -> Dict[str, Any]:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            return {"safe": False, "reason": f"Syntax error: {e}"}
 
-    def get_audit_log(self, limit: int = 50) -> List[Dict]:
-        return self._audit_log[-limit:]
+        for node in ast.walk(tree):
+            # Block import statements for dangerous modules
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [n.name for n in getattr(node, "names", [])]
+                module = getattr(node, "module", "") or ""
+                all_names = names + [module]
+                for name in all_names:
+                    root = name.split(".")[0] if name else ""
+                    if root in BLOCKED_MODULES:
+                        return {"safe": False, "reason": f"Blocked module: {root}"}
+
+            # Block dangerous function calls
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id in BLOCKED_BUILTINS:
+                        return {"safe": False, "reason": f"Blocked builtin: {node.func.id}"}
+
+        return {"safe": True, "reason": None}
+
+    def _serialize(self, value: Any) -> Any:
+        if value is None:
+            return None
+        try:
+            import json
+            json.dumps(value)
+            return value
+        except (TypeError, ValueError):
+            return str(value)
 
     def stats(self) -> Dict[str, Any]:
-        total = len(self._audit_log)
-        success = sum(1 for e in self._audit_log if e["status"] == SandboxStatus.COMPLETED.value)
-        timeouts = sum(1 for e in self._audit_log if e["status"] == SandboxStatus.TIMEOUT.value)
-        avg_time = (
-            sum(e["execution_time"] for e in self._audit_log) / total
-            if total > 0 else 0.0
-        )
-        return {
-            "total_executions": total,
-            "success_count": success,
-            "timeout_count": timeouts,
-            "error_count": total - success - timeouts,
-            "avg_execution_time": round(avg_time, 3),
-            "active_now": self.get_active_count()
-        }
+        return {"total_executions": self._execution_count}
