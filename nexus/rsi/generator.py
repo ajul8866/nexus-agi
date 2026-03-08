@@ -15,7 +15,7 @@ class CapabilityGap:
     failed_tasks: List[str]
     missing_capability: str
     frequency: int
-    severity: float
+    severity: float  # 0-1
 
 
 @dataclass
@@ -35,7 +35,7 @@ class ValidationResult:
     valid: bool
     errors: List[str]
     warnings: List[str]
-    safety_score: float
+    safety_score: float  # 0-1
 
 
 TOOL_TEMPLATES = {
@@ -100,30 +100,38 @@ class ToolGenerator:
         self._capability_gaps: List[CapabilityGap] = []
 
     def identify_capability_gap(self, failed_tasks: List[str]) -> CapabilityGap:
+        """Analyze failed tasks to identify missing capability."""
         keywords: Dict[str, int] = {}
         for task in failed_tasks:
             for word in task.lower().split():
                 if len(word) > 4:
                     keywords[word] = keywords.get(word, 0) + 1
+
         top_keyword = max(keywords, key=keywords.get) if keywords else "unknown"
+
         capability_map = {
             "fetch": "data_fetcher", "download": "data_fetcher", "http": "data_fetcher",
             "calculate": "calculator", "compute": "calculator", "math": "calculator",
             "process": "text_processor", "parse": "text_processor", "extract": "text_processor",
         }
         missing = capability_map.get(top_keyword, "generic_processor")
+
         gap = CapabilityGap(
             description=f"Unable to handle tasks requiring '{top_keyword}' capability",
-            failed_tasks=failed_tasks, missing_capability=missing,
-            frequency=len(failed_tasks), severity=min(len(failed_tasks) / 10.0, 1.0)
+            failed_tasks=failed_tasks,
+            missing_capability=missing,
+            frequency=len(failed_tasks),
+            severity=min(len(failed_tasks) / 10.0, 1.0)
         )
         self._capability_gaps.append(gap)
         return gap
 
     def generate_tool_spec(self, gap: CapabilityGap) -> ToolSpec:
+        """Generate a ToolSpec to fill the capability gap."""
         template_key = gap.missing_capability if gap.missing_capability in TOOL_TEMPLATES else "text_processor"
         tool_name = f"auto_{gap.missing_capability}_{int(time.time())}"
         code = TOOL_TEMPLATES[template_key].format(name=tool_name)
+
         return ToolSpec(
             name=tool_name,
             description=f"Auto-generated tool for: {gap.description}",
@@ -134,26 +142,39 @@ class ToolGenerator:
         )
 
     def validate_tool(self, tool_spec: ToolSpec) -> ValidationResult:
+        """Validate tool code for syntax and safety."""
         errors = []
         warnings = []
         safety_score = 1.0
+
+        # Syntax check
         try:
             ast.parse(tool_spec.code_template)
         except SyntaxError as e:
             errors.append(f"Syntax error: {e}")
+
+        # Safety check
         for pattern in DANGEROUS_PATTERNS:
             if pattern in tool_spec.code_template:
                 errors.append(f"Dangerous pattern detected: {pattern}")
                 safety_score -= 0.3
+
         if len(tool_spec.code_template) > 5000:
             warnings.append("Tool code is very long (>5000 chars)")
+
         safety_score = max(0.0, safety_score)
         valid = len(errors) == 0 and safety_score > 0.5
+
         if valid:
             tool_spec.validated = True
-        return ValidationResult(valid=valid, errors=errors, warnings=warnings, safety_score=round(safety_score, 2))
+
+        return ValidationResult(
+            valid=valid, errors=errors,
+            warnings=warnings, safety_score=round(safety_score, 2)
+        )
 
     def register_tool(self, tool_spec: ToolSpec) -> bool:
+        """Register validated tool for use."""
         if not tool_spec.validated:
             result = self.validate_tool(tool_spec)
             if not result.valid:
@@ -162,8 +183,11 @@ class ToolGenerator:
         return True
 
     def list_tools(self) -> List[Dict[str, Any]]:
-        return [{"name": t.name, "description": t.description, "tags": t.tags, "validated": t.validated}
-                for t in self._generated_tools.values()]
+        return [
+            {"name": t.name, "description": t.description,
+             "tags": t.tags, "validated": t.validated}
+            for t in self._generated_tools.values()
+        ]
 
     def stats(self) -> Dict[str, Any]:
         return {
