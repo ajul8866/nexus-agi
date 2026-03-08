@@ -1,108 +1,156 @@
-"""
-NEXUS-AGI Agent Base Class
-"""
-from __future__ import annotations
-import time
+"""Base Agent class for NEXUS-AGI."""
+
+import asyncio
+import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum, auto
 from typing import Any, Dict, List, Optional
-from enum import Enum
+
+logger = logging.getLogger("nexus.agents.base")
 
 
-class AgentStatus(Enum):
-    IDLE = "idle"
-    RUNNING = "running"
-    WAITING = "waiting"
-    ERROR = "error"
-    TERMINATED = "terminated"
-
-
-@dataclass
-class AgentMessage:
-    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    sender_id: str = ""
-    recipient_id: str = ""
-    content: Any = None
-    msg_type: str = "task"
-    timestamp: float = field(default_factory=time.time)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+class AgentCapability(Enum):
+    REASONING = auto()
+    PLANNING = auto()
+    CODING = auto()
+    RESEARCH = auto()
+    REFLECTION = auto()
+    ORCHESTRATION = auto()
+    TOOL_USE = auto()
+    MEMORY_MANAGEMENT = auto()
+    SAFETY = auto()
 
 
 @dataclass
-class AgentResult:
+class AgentState:
     agent_id: str
-    task_id: str
-    success: bool
-    output: Any
-    error: Optional[str] = None
-    latency: float = 0.0
-    tokens_used: int = 0
-    timestamp: float = field(default_factory=time.time)
+    status: str = "idle"
+    current_task: Optional[str] = None
+    task_history: List[Dict[str, Any]] = field(default_factory=list)
+    metrics: Dict[str, float] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    last_active: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "status": self.status,
+            "current_task": self.current_task,
+            "task_count": len(self.task_history),
+            "metrics": self.metrics,
+            "created_at": self.created_at.isoformat(),
+            "last_active": self.last_active.isoformat(),
+        }
 
 
 class AgentBase(ABC):
     """
     Abstract base class for all NEXUS-AGI agents.
-    Provides common infrastructure: messaging, state, logging.
+    Provides async execution loop, memory, tools, and messaging.
     """
 
-    def __init__(self, name: str, role: str, capabilities: Optional[List[str]] = None):
-        self.agent_id = f"{role}_{uuid.uuid4().hex[:8]}"
-        self.name = name
-        self.role = role
+    def __init__(self, agent_id: Optional[str] = None, capabilities: Optional[List[AgentCapability]] = None, max_queue_size: int = 100):
+        self.agent_id = agent_id or str(uuid.uuid4())
         self.capabilities = capabilities or []
-        self.status = AgentStatus.IDLE
-        self._message_queue: List[AgentMessage] = []
-        self._history: List[AgentResult] = []
-        self._created_at = time.time()
-        self._metadata: Dict[str, Any] = {}
+        self.state = AgentState(agent_id=self.agent_id)
+        self.message_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
+        self.memory_store: Dict[str, Any] = {}
+        self.tool_registry: Dict[str, Any] = {}
+        self._running = False
+        self._loop_task: Optional[asyncio.Task] = None
+        logger.info("Agent created id=%s caps=%s", self.agent_id, [c.name for c in self.capabilities])
 
     @abstractmethod
-    async def execute(self, task: str, context: Optional[Dict[str, Any]] = None) -> AgentResult:
-        """Execute a task and return the result."""
-        pass
+    async def perceive(self, input_data: Any) -> Any:
+        """Process incoming percepts/messages."""
 
     @abstractmethod
-    async def plan(self, goal: str) -> List[str]:
-        """Generate a plan (list of steps) to achieve a goal."""
-        pass
+    async def think(self, percept: Any) -> Any:
+        """Reason about a percept and produce a plan or decision."""
 
-    async def send_message(self, recipient_id: str, content: Any, msg_type: str = "task") -> AgentMessage:
-        msg = AgentMessage(sender_id=self.agent_id, recipient_id=recipient_id,
-                           content=content, msg_type=msg_type)
-        return msg
+    @abstractmethod
+    async def act(self, decision: Any) -> Any:
+        """Execute the decision and return a result."""
 
-    def receive_message(self, message: AgentMessage) -> None:
-        self._message_queue.append(message)
+    @abstractmethod
+    async def reflect(self) -> Any:
+        """Meta-cognitive reflection on recent actions."""
 
-    def get_pending_messages(self) -> List[AgentMessage]:
-        msgs = list(self._message_queue)
-        self._message_queue.clear()
-        return msgs
+    async def start(self) -> None:
+        self._running = True
+        self.state.status = "running"
+        logger.info("Agent %s started", self.agent_id)
+        await self._execution_loop()
 
-    def record_result(self, result: AgentResult) -> None:
-        self._history.append(result)
+    async def stop(self) -> None:
+        self._running = False
+        self.state.status = "stopped"
+        logger.info("Agent %s stopped", self.agent_id)
 
-    def get_success_rate(self) -> float:
-        if not self._history:
-            return 0.0
-        return sum(1 for r in self._history if r.success) / len(self._history)
+    async def pause(self) -> None:
+        self._running = False
+        self.state.status = "paused"
 
-    def get_avg_latency(self) -> float:
-        if not self._history:
-            return 0.0
-        return sum(r.latency for r in self._history) / len(self._history)
+    async def resume(self) -> None:
+        self._running = True
+        self.state.status = "running"
+        await self._execution_loop()
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "agent_id": self.agent_id, "name": self.name, "role": self.role,
-            "capabilities": self.capabilities, "status": self.status.value,
-            "success_rate": round(self.get_success_rate(), 3),
-            "avg_latency": round(self.get_avg_latency(), 3),
-            "tasks_completed": len(self._history),
-            "created_at": self._created_at
-        }
+    async def _execution_loop(self) -> None:
+        while self._running:
+            try:
+                try:
+                    raw_input = await asyncio.wait_for(self.message_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    await asyncio.sleep(0.1)
+                    continue
 
-    def __repr__(self) -> str:
-        return f"<{self.__class__.__name__} id={self.agent_id} name={self.name} status={self.status.value}>"
+                self.state.last_active = datetime.utcnow()
+                self.state.current_task = str(raw_input)[:80]
+                self.state.status = "thinking"
+
+                percept = await self.perceive(raw_input)
+                decision = await self.think(percept)
+                result = await self.act(decision)
+
+                self.state.task_history.append({"input": str(raw_input)[:200], "result": str(result)[:200], "timestamp": datetime.utcnow().isoformat()})
+                self.state.status = "idle"
+                self.state.current_task = None
+                self.message_queue.task_done()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.exception("Agent %s error: %s", self.agent_id, exc)
+                self.state.status = "error"
+                self.state.metrics["error_count"] = self.state.metrics.get("error_count", 0) + 1
+                await asyncio.sleep(0.5)
+
+    async def receive(self, message: Any) -> None:
+        await self.message_queue.put(message)
+
+    def register_tool(self, name: str, func: Any, description: str = "") -> None:
+        self.tool_registry[name] = {"func": func, "description": description}
+
+    async def use_tool(self, name: str, **kwargs) -> Any:
+        if name not in self.tool_registry:
+            raise ValueError(f"Tool not found: {name}")
+        tool = self.tool_registry[name]
+        if asyncio.iscoroutinefunction(tool["func"]):
+            return await tool["func"](**kwargs)
+        return tool["func"](**kwargs)
+
+    def store_memory(self, key: str, value: Any) -> None:
+        self.memory_store[key] = value
+
+    def recall(self, key: str, default: Any = None) -> Any:
+        return self.memory_store.get(key, default)
+
+    def has_capability(self, cap: AgentCapability) -> bool:
+        return cap in self.capabilities
+
+    def get_state(self) -> Dict[str, Any]:
+        return self.state.to_dict()
