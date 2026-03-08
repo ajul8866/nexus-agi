@@ -1,0 +1,65 @@
+version: "3.9"
+
+services:
+  nexus-api:
+    build: .
+    container_name: nexus-agi-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://nexus:nexus@postgres:5432/nexus
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    networks:
+      - nexus-net
+
+  nexus-worker:
+    build: .
+    container_name: nexus-agi-worker
+    command: celery -A nexus.worker worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://nexus:nexus@postgres:5432/nexus
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    networks:
+      - nexus-net
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: nexus-postgres
+    environment:
+      POSTGRES_DB: nexus
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - nexus-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: nexus-redis
+    volumes:
+      - redis_data:/data
+    networks:
+      - nexus-net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  nexus-net:
+    driver: bridge
