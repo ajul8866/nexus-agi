@@ -1,5 +1,5 @@
 from .model import WorldModel
 from .causal import CausalReasoner
-from .prediction import PredictionEngine
+from .prediction import Predictor
 
-__all__ = ["WorldModel", "CausalReasoner", "PredictionEngine"]
+__all__ = ["WorldModel", "CausalReasoner", "Predictor"]
