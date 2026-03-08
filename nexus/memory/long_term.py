@@ -1,120 +1,226 @@
-"""
-NEXUS-AGI Long-Term Memory
-Persistent storage for knowledge and experiences
-"""
-from __future__ import annotations
-import time
+"""LongTermMemory - persistent storage with vector search and consolidation."""
+
 import json
+import logging
+import sqlite3
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("nexus.memory.long_term")
 
 
 @dataclass
-class MemoryRecord:
-    id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
+class LongTermRecord:
+    record_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    category: str = "general"
     content: Any = None
-    memory_type: str = "general"
+    summary: str = ""
     importance: float = 0.5
-    tags: List[str] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
-    last_accessed: float = field(default_factory=time.time)
+    embedding: Optional[List[float]] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
     access_count: int = 0
+    tags: List[str] = field(default_factory=list)
     source_agent: str = ""
-    consolidated: bool = False
+    verified: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"record_id": self.record_id, "category": self.category, "summary": self.summary, "importance": self.importance, "created_at": self.created_at.isoformat(), "updated_at": self.updated_at.isoformat(), "access_count": self.access_count, "tags": self.tags, "source_agent": self.source_agent, "verified": self.verified}
 
 
 class LongTermMemory:
     """
-    Persistent long-term memory with consolidation and retrieval.
-    In production, backed by a database (SQLite/PostgreSQL).
+    Long-term persistent memory backed by SQLite.
+    Supports semantic search (cosine similarity on stored embeddings),
+    category-based retrieval, importance ranking, and memory consolidation.
     """
 
-    CONSOLIDATION_THRESHOLD = 3  # access_count before consolidation
+    def __init__(self, db_path: str = ":memory:", max_records: int = 1_000_000):
+        self.db_path = db_path
+        self.max_records = max_records
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_schema()
+        self._cache: Dict[str, LongTermRecord] = {}
 
-    def __init__(self, storage_path: Optional[str] = None):
-        self._records: Dict[str, MemoryRecord] = {}
-        self._type_index: Dict[str, List[str]] = {}
-        self._tag_index: Dict[str, List[str]] = {}
-        self.storage_path = storage_path
+    def _init_schema(self) -> None:
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS ltm (
+                record_id   TEXT PRIMARY KEY,
+                category    TEXT NOT NULL DEFAULT 'general',
+                content     TEXT,
+                summary     TEXT,
+                importance  REAL DEFAULT 0.5,
+                embedding   TEXT,
+                created_at  TEXT,
+                updated_at  TEXT,
+                access_count INTEGER DEFAULT 0,
+                tags        TEXT,
+                source_agent TEXT,
+                verified    INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_category ON ltm(category);
+            CREATE INDEX IF NOT EXISTS idx_importance ON ltm(importance DESC);
+            CREATE INDEX IF NOT EXISTS idx_created ON ltm(created_at DESC);
+        """)
+        self._conn.commit()
 
-    def store(self, content: Any, memory_type: str = "general",
-              importance: float = 0.5, tags: Optional[List[str]] = None,
-              source_agent: str = "") -> MemoryRecord:
-        record = MemoryRecord(
-            content=content, memory_type=memory_type, importance=importance,
-            tags=tags or [], source_agent=source_agent
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    def store(self, record: LongTermRecord) -> str:
+        content_json = json.dumps(record.content) if record.content is not None else None
+        embedding_json = json.dumps(record.embedding) if record.embedding else None
+        tags_json = json.dumps(record.tags)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO ltm VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (record.record_id, record.category, content_json, record.summary,
+             record.importance, embedding_json, record.created_at.isoformat(),
+             record.updated_at.isoformat(), record.access_count,
+             tags_json, record.source_agent, int(record.verified))
         )
-        self._records[record.id] = record
-        self._type_index.setdefault(memory_type, []).append(record.id)
-        for tag in (tags or []):
-            self._tag_index.setdefault(tag.lower(), []).append(record.id)
-        return record
+        self._conn.commit()
+        self._cache[record.record_id] = record
+        return record.record_id
 
-    def retrieve(self, query: str, limit: int = 20,
-                 memory_type: Optional[str] = None,
-                 min_importance: float = 0.0) -> List[MemoryRecord]:
-        candidates = list(self._records.values())
-        if memory_type:
-            ids = self._type_index.get(memory_type, [])
-            candidates = [self._records[rid] for rid in ids if rid in self._records]
-        candidates = [r for r in candidates if r.importance >= min_importance]
-        query_lower = query.lower()
-        scored = []
-        for record in candidates:
-            score = record.importance
-            content_str = str(record.content).lower()
-            if query_lower in content_str:
-                score += 0.4
-            tag_match = sum(1 for t in record.tags if query_lower in t.lower())
-            score += tag_match * 0.1
-            score += min(record.access_count * 0.02, 0.2)
-            scored.append((score, record))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        results = [r for _, r in scored[:limit]]
+    def add(self, content: Any, category: str = "general", summary: str = "",
+            importance: float = 0.5, tags: Optional[List[str]] = None,
+            source_agent: str = "", embedding: Optional[List[float]] = None) -> LongTermRecord:
+        rec = LongTermRecord(
+            category=category, content=content,
+            summary=summary or str(content)[:200],
+            importance=importance, tags=tags or [],
+            source_agent=source_agent, embedding=embedding
+        )
+        self.store(rec)
+        return rec
+
+    def update(self, record_id: str, **kwargs) -> bool:
+        if record_id not in self._cache:
+            rec = self.get(record_id)
+            if rec is None:
+                return False
+        else:
+            rec = self._cache[record_id]
+        for k, v in kwargs.items():
+            if hasattr(rec, k):
+                setattr(rec, k, v)
+        rec.updated_at = datetime.utcnow()
+        self.store(rec)
+        return True
+
+    def delete(self, record_id: str) -> bool:
+        self._conn.execute("DELETE FROM ltm WHERE record_id=?", (record_id,))
+        self._conn.commit()
+        self._cache.pop(record_id, None)
+        return True
+
+    # ------------------------------------------------------------------
+    # Read
+    # ------------------------------------------------------------------
+
+    def get(self, record_id: str) -> Optional[LongTermRecord]:
+        if record_id in self._cache:
+            return self._cache[record_id]
+        row = self._conn.execute("SELECT * FROM ltm WHERE record_id=?", (record_id,)).fetchone()
+        if not row:
+            return None
+        return self._row_to_record(row)
+
+    def search(self, query: str, category: Optional[str] = None, top_k: int = 20) -> List[LongTermRecord]:
+        sql = "SELECT * FROM ltm WHERE (summary LIKE ? OR content LIKE ?)"
+        params: List[Any] = [f"%{query}%", f"%{query}%"]
+        if category:
+            sql += " AND category=?"
+            params.append(category)
+        sql += " ORDER BY importance DESC LIMIT ?"
+        params.append(top_k)
+        rows = self._conn.execute(sql, params).fetchall()
+        results = [self._row_to_record(r) for r in rows]
         for r in results:
-            r.last_accessed = time.time()
             r.access_count += 1
+            self._conn.execute("UPDATE ltm SET access_count=? WHERE record_id=?", (r.access_count, r.record_id))
+        self._conn.commit()
         return results
 
-    def get_by_id(self, record_id: str) -> Optional[MemoryRecord]:
-        return self._records.get(record_id)
+    def get_by_category(self, category: str, limit: int = 100, min_importance: float = 0.0) -> List[LongTermRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM ltm WHERE category=? AND importance>=? ORDER BY importance DESC LIMIT ?",
+            (category, min_importance, limit)
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
 
-    def consolidate(self) -> int:
-        """Mark frequently accessed memories as consolidated."""
-        consolidated = 0
-        for record in self._records.values():
-            if record.access_count >= self.CONSOLIDATION_THRESHOLD and not record.consolidated:
-                record.consolidated = True
-                record.importance = min(1.0, record.importance + 0.1)
-                consolidated += 1
-        return consolidated
+    def get_important(self, min_importance: float = 0.8, limit: int = 50) -> List[LongTermRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM ltm WHERE importance>=? ORDER BY importance DESC LIMIT ?",
+            (min_importance, limit)
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
 
-    def forget(self, record_id: str) -> bool:
-        record = self._records.pop(record_id, None)
-        if record:
-            ids = self._type_index.get(record.memory_type, [])
-            if record_id in ids:
-                ids.remove(record_id)
-            for tag in record.tags:
-                tag_ids = self._tag_index.get(tag.lower(), [])
-                if record_id in tag_ids:
-                    tag_ids.remove(record_id)
-            return True
-        return False
+    def get_recent(self, limit: int = 50) -> List[LongTermRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM ltm ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
 
-    def prune_low_importance(self, threshold: float = 0.2) -> int:
-        to_delete = [rid for rid, r in self._records.items() if r.importance < threshold and not r.consolidated]
-        for rid in to_delete:
-            self.forget(rid)
-        return len(to_delete)
+    def cosine_search(self, query_embedding: List[float], top_k: int = 10) -> List[LongTermRecord]:
+        """Brute-force cosine similarity search over stored embeddings."""
+        rows = self._conn.execute("SELECT * FROM ltm WHERE embedding IS NOT NULL").fetchall()
+        scored: List[tuple] = []
+        for row in rows:
+            emb = json.loads(row["embedding"])
+            score = self._cosine(query_embedding, emb)
+            scored.append((score, row))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [self._row_to_record(r) for _, r in scored[:top_k]]
+
+    @staticmethod
+    def _cosine(a: List[float], b: List[float]) -> float:
+        if len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x ** 2 for x in a) ** 0.5
+        norm_b = sum(x ** 2 for x in b) ** 0.5
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    # ------------------------------------------------------------------
+    # Maintenance
+    # ------------------------------------------------------------------
+
+    def consolidate(self, min_importance: float = 0.3, max_keep: int = 100_000) -> int:
+        """Remove low-importance, low-access records beyond max_keep."""
+        count_row = self._conn.execute("SELECT COUNT(*) FROM ltm").fetchone()
+        total = count_row[0]
+        if total <= max_keep:
+            return 0
+        excess = total - max_keep
+        self._conn.execute(
+            "DELETE FROM ltm WHERE record_id IN (SELECT record_id FROM ltm WHERE importance<? ORDER BY access_count ASC, created_at ASC LIMIT ?)",
+            (min_importance, excess)
+        )
+        self._conn.commit()
+        return excess
+
+    def _row_to_record(self, row: sqlite3.Row) -> LongTermRecord:
+        content = json.loads(row["content"]) if row["content"] else None
+        embedding = json.loads(row["embedding"]) if row["embedding"] else None
+        tags = json.loads(row["tags"]) if row["tags"] else []
+        return LongTermRecord(
+            record_id=row["record_id"], category=row["category"],
+            content=content, summary=row["summary"] or "",
+            importance=row["importance"], embedding=embedding,
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            access_count=row["access_count"], tags=tags,
+            source_agent=row["source_agent"] or "",
+            verified=bool(row["verified"])
+        )
 
     def stats(self) -> Dict[str, Any]:
-        records = list(self._records.values())
-        return {
-            "total_records": len(records),
-            "memory_types": list(self._type_index.keys()),
-            "consolidated": sum(1 for r in records if r.consolidated),
-            "avg_importance": round(sum(r.importance for r in records) / len(records), 3) if records else 0,
-            "total_tags": len(self._tag_index),
-        }
+        row = self._conn.execute("SELECT COUNT(*), AVG(importance), MAX(importance) FROM ltm").fetchone()
+        return {"total_records": row[0], "avg_importance": round(row[1] or 0, 3), "max_importance": round(row[2] or 0, 3), "db_path": self.db_path, "max_records": self.max_records}
